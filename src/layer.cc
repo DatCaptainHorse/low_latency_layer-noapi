@@ -734,10 +734,14 @@ CreateSwapchainKHR(VkDevice device, VkSwapchainCreateInfoKHR* pCreateInfo,
                    const VkAllocationCallbacks* pAllocator,
                    VkSwapchainKHR* pSwapchain) noexcept {
 
-    if (!(pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT))
-        pCreateInfo->flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
-
     const auto context = layer_context.get_context(device);
+    if (context->instance.layer.config.allow_present_timing
+        && context->display_extensions.present_timing
+        && !(pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT))
+    {
+        pCreateInfo->flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+    }
+
     if (const auto result = context->vtable.CreateSwapchainKHR(
             device, pCreateInfo, pAllocator, pSwapchain);
         result != VK_SUCCESS) {

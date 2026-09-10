@@ -85,10 +85,7 @@ class Config final {
     const std::uint32_t queue_depth{};
 
     // The only source of display timing the layer has, and therefore the only
-    // way Deadline pacing can engage. It is very new: the implementation
-    // tested against (Mesa 26.3.0-devel, ANV, Wayland) hangs inside
-    // vkQueuePresentKHR as soon as a present carries a stage query, so it is
-    // off unless asked for. Without it, pacing uses Drain.
+    // way Deadline pacing can engage. Without it, pacing uses Drain.
     const bool allow_present_timing{};
 
     // Pace without measuring: no timestamp command buffers are injected into
@@ -96,8 +93,7 @@ class Config final {
     // a plain frame limiter. Two uses: isolating the layer's pacing from its
     // measurement when something looks wrong, and working around the abort
     // that VK_LAYER_KHRONOS_validation raises on the injected timestamp
-    // command buffers (reproducible with the upstream layer too - see
-    // test/paced_present.cc).
+    // command buffers (reproducible with the upstream layer too).
     const bool inject_timestamps{};
 
     // Begin with the effect off, so the hotkey turns it on. Useful for an A/B
