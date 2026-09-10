@@ -16,7 +16,7 @@ A C++23 implicit Vulkan layer that reduces click-to-photon latency.
 Clone this repo.
 
 ```
-    $ git clone https://github.com/Korthos-Software/low_latency_layer.git
+    $ git clone https://github.com/DatCaptainHorse/low_latency_layer-noapi
     $ cd low_latency_layer
 ```
 
