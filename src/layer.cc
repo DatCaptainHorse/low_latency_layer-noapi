@@ -1,5 +1,6 @@
 #include "layer.hh"
 
+#include <array>
 #include <iterator>
 #include <ranges>
 #include <span>
@@ -17,14 +18,14 @@
 #include <vulkan/vulkan.hpp>
 #include <vulkan/vulkan_core.h>
 
+#include "config.hh"
 #include "device_clock.hh"
 #include "device_context.hh"
+#include "frame_pacer.hh"
 #include "instance_context.hh"
 #include "layer_context.hh"
 #include "queue_context.hh"
-#include "strategies/anti_lag/device_strategy.hh"
-#include "strategies/low_latency2/device_strategy.hh"
-#include "strategies/low_latency2/queue_strategy.hh"
+#include "queue_tracker.hh"
 #include "timestamp_pool.hh"
 
 namespace low_latency {
@@ -77,11 +78,80 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    if (const auto result = create_instance(pCreateInfo, pAllocator, pInstance);
-        result != VK_SUCCESS) {
+    // present_id2 and present_timing are both advertised as surface
+    // capabilities, which can only be read through
+    // vkGetPhysicalDeviceSurfaceCapabilities2KHR. Applications that use none
+    // of them have no reason to have enabled that instance extension, so add
+    // it ourselves rather than querying it illegally later.
+    //
+    // We do not check availability first. Asking the next layer to enumerate
+    // instance extensions means calling its vkGetInstanceProcAddr with a null
+    // instance, which layers are not obliged to serve and which at least one
+    // shipping layer segfaults on. Attempting the addition and retrying
+    // without it is both safer and cheaper.
+    const auto extra_extensions = [&]() -> std::vector<const char*> {
+        if (layer_context.config.mode == PacingMode::Off) {
+            return {};
+        }
 
+        const auto names = std::span{pCreateInfo->ppEnabledExtensionNames,
+                                     pCreateInfo->enabledExtensionCount};
+
+        // The second one only matters for pre-1.1 applications, where the
+        // promoted vkGetPhysicalDeviceFeatures2 must not be called and the
+        // KHR alias is the only legal way to read a feature bit.
+        constexpr auto wanted = std::array{
+            VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,
+            VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
+        };
+
+        auto missing = std::vector<const char*>{};
+        for (const auto& candidate : wanted) {
+            const auto already =
+                std::ranges::any_of(names, [&](const auto& name) {
+                    return std::string_view{name} == candidate;
+                });
+            if (!already) {
+                missing.push_back(candidate);
+            }
+        }
+        return missing;
+    }();
+
+    const auto result = [&]() -> VkResult {
+        if (extra_extensions.empty()) {
+            return create_instance(pCreateInfo, pAllocator, pInstance);
+        }
+
+        auto names = std::vector(pCreateInfo->ppEnabledExtensionNames,
+                                 pCreateInfo->ppEnabledExtensionNames +
+                                     pCreateInfo->enabledExtensionCount);
+        std::ranges::copy(extra_extensions, std::back_inserter(names));
+
+        auto next_create_info = *pCreateInfo;
+        next_create_info.ppEnabledExtensionNames = std::data(names);
+        next_create_info.enabledExtensionCount =
+            static_cast<std::uint32_t>(std::size(names));
+
+        const auto result =
+            create_instance(&next_create_info, pAllocator, pInstance);
+        if (result != VK_ERROR_EXTENSION_NOT_PRESENT) {
+            return result;
+        }
+
+        // Without these, deadline pacing has nothing to key off, but drain
+        // pacing still works.
+        return create_instance(pCreateInfo, pAllocator, pInstance);
+    }();
+
+    if (result != VK_SUCCESS) {
         return result;
     }
+
+    const auto api_version =
+        pCreateInfo->pApplicationInfo && pCreateInfo->pApplicationInfo->apiVersion
+            ? pCreateInfo->pApplicationInfo->apiVersion
+            : VK_API_VERSION_1_0;
 
     auto vtable = VkuInstanceDispatchTable{};
     vkuInitInstanceDispatchTable(*pInstance, &vtable, gipa);
@@ -89,10 +159,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(
     const auto key = layer_context.get_key(*pInstance);
     const auto lock = std::scoped_lock{layer_context.mutex};
     assert(!layer_context.contexts.contains(key));
-    assert(pCreateInfo);
     layer_context.contexts.try_emplace(
         key, std::make_shared<InstanceContext>(
-                 layer_context, *pInstance, *pCreateInfo, std::move(vtable)));
+                 layer_context, *pInstance, api_version, std::move(vtable)));
 
     return VK_SUCCESS;
 }
@@ -167,14 +236,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(
     const auto requested = std::unordered_set<std::string_view>(
         std::begin(enabled_extensions), std::end(enabled_extensions));
 
-    const auto was_layer_enabled =
-        requested.contains(!layer_context.should_expose_reflex
-                               ? VK_AMD_ANTI_LAG_EXTENSION_NAME
-                               : VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
-
     const auto context = layer_context.get_context(physical_device);
-    if (was_layer_enabled && !context->supports_required_extensions) {
-        return VK_ERROR_INITIALIZATION_FAILED;
+
+    // The layer used to switch itself on when the application enabled the
+    // extension it was impersonating. Nothing impersonates anything now, so
+    // being loaded at all is the opt-in and the only remaining question is
+    // whether this physical device can carry us.
+    const auto is_active = layer_context.config.mode != PacingMode::Off &&
+                           context->supports_required_extensions;
+
+    if (is_active) {
+        // First device we are actually going to act on: this is where the
+        // runtime toggle's input monitor gets started.
+        layer_context.ensure_hotkey();
     }
 
     const auto create_info = [&]() -> auto {
@@ -206,18 +280,66 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(
     const_cast<VkLayerDeviceCreateInfo*>(create_info)->u.pLayerInfo =
         create_info->u.pLayerInfo->pNext;
 
+    // Which display extensions we will actually turn on. Availability alone
+    // is not enough - present_wait needs present_id alongside it, and the
+    // configuration can veto either.
+    const auto display_extensions = [&]() -> DisplayExtensions {
+        if (!is_active) {
+            return {};
+        }
+
+        const auto& available = context->display_extensions;
+        const auto& config = layer_context.config;
+
+        auto wanted = DisplayExtensions{
+            .present_id2 = available.present_id2,
+            .present_timing =
+                available.present_timing && config.allow_present_timing,
+            .present_at_relative_time = available.present_at_relative_time &&
+                                        config.allow_present_timing,
+        };
+
+        // Present timing is built on present_id2, and its relative scheduling
+        // feature is only meaningful alongside it.
+        if (!wanted.present_id2) {
+            wanted.present_timing = false;
+        }
+        if (!wanted.present_timing) {
+            wanted.present_at_relative_time = false;
+
+            // Labelling presents is only worth the trouble so that timings
+            // can be asked about them.
+            wanted.present_id2 = false;
+        }
+
+        return wanted;
+    }();
+
     // Build a next extensions vector from what they have requested.
     const auto next_extensions = [&]() -> std::vector<const char*> {
         auto next_extensions = std::vector(std::begin(enabled_extensions),
                                            std::end(enabled_extensions));
 
-        // Only append the extra extension if it wasn't already asked for.
-        if (was_layer_enabled) {
-            std::ranges::copy_if(PhysicalDeviceContext::required_extensions,
-                                 std::back_inserter(next_extensions),
-                                 [&requested](const auto& wanted) {
-                                     return !requested.contains(wanted);
-                                 });
+        const auto append = [&](const char* const name) {
+            if (name && !requested.contains(name)) {
+                next_extensions.push_back(name);
+            }
+        };
+
+        if (!is_active) {
+            return next_extensions;
+        }
+
+        for (const auto& name : PhysicalDeviceContext::required_extensions) {
+            append(name);
+        }
+        append(context->calibrated_timestamps_extension);
+
+        if (display_extensions.present_id2) {
+            append(VK_KHR_PRESENT_ID_2_EXTENSION_NAME);
+        }
+        if (display_extensions.present_timing) {
+            append(VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
         }
 
         return next_extensions;
@@ -231,21 +353,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(
             static_cast<std::uint32_t>(std::size(next_extensions));
 
         auto next_create_info = vku::safe_VkDeviceCreateInfo{&create_info_copy};
-        if (!was_layer_enabled) {
+        if (!is_active) {
             return next_create_info;
         }
+
+        auto* const pnext = const_cast<void*>(next_create_info.pNext);
 
         // Sync2 lives in 1.3 features first. If that doesn't exist look for
         // sync2 features or append it.
         if (const auto vk13 =
                 vku::FindStructInPNextChain<VkPhysicalDeviceVulkan13Features>(
-                    const_cast<void*>(next_create_info.pNext));
+                    pnext);
             vk13) {
 
             vk13->synchronization2 = VK_TRUE;
         } else if (const auto s2f = vku::FindStructInPNextChain<
-                       VkPhysicalDeviceSynchronization2Features>(
-                       const_cast<void*>(next_create_info.pNext));
+                       VkPhysicalDeviceSynchronization2Features>(pnext);
                    s2f) {
 
             s2f->synchronization2 = VK_TRUE;
@@ -262,13 +385,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(
         // HQR is in 1.2 features first - then same idea as sync2.
         if (const auto vk12 =
                 vku::FindStructInPNextChain<VkPhysicalDeviceVulkan12Features>(
-                    const_cast<void*>(next_create_info.pNext));
+                    pnext);
             vk12) {
 
             vk12->hostQueryReset = VK_TRUE;
         } else if (const auto hqrf = vku::FindStructInPNextChain<
-                       VkPhysicalDeviceHostQueryResetFeatures>(
-                       const_cast<void*>(next_create_info.pNext));
+                       VkPhysicalDeviceHostQueryResetFeatures>(pnext);
                    hqrf) {
 
             hqrf->hostQueryReset = VK_TRUE;
@@ -281,6 +403,49 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(
                     .hostQueryReset = VK_TRUE,
                 });
         }
+
+        // The display extensions all gate themselves behind a feature bit.
+        // None of them are promoted into a core feature struct, so unlike
+        // sync2 and host query reset there is only ever one place to look.
+        const auto enable_feature = [&]<typename T>(const bool wanted, T&& base,
+                                                    VkBool32 T::* member) {
+            if (!wanted) {
+                return;
+            }
+            if (const auto existing =
+                    vku::FindStructInPNextChain<std::remove_cvref_t<T>>(pnext);
+                existing) {
+
+                existing->*member = VK_TRUE;
+                return;
+            }
+            base.*member = VK_TRUE;
+            vku::AddToPnext(next_create_info, base);
+        };
+
+        enable_feature(display_extensions.present_id2,
+                       VkPhysicalDevicePresentId2FeaturesKHR{
+                           .sType =
+                               VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR,
+                       },
+                       &VkPhysicalDevicePresentId2FeaturesKHR::presentId2);
+
+        enable_feature(display_extensions.present_timing,
+                       VkPhysicalDevicePresentTimingFeaturesEXT{
+                           .sType =
+                               VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT,
+                       },
+                       &VkPhysicalDevicePresentTimingFeaturesEXT::presentTiming);
+
+        // Chained onto the same structure the call above just added, so it
+        // will be found rather than duplicated.
+        enable_feature(
+            display_extensions.present_at_relative_time,
+            VkPhysicalDevicePresentTimingFeaturesEXT{
+                .sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT,
+            },
+            &VkPhysicalDevicePresentTimingFeaturesEXT::presentAtRelativeTime);
 
         return next_create_info;
     }();
@@ -305,9 +470,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(
     const auto lock = std::scoped_lock{layer_context.mutex};
     assert(!layer_context.contexts.contains(key));
     layer_context.contexts.try_emplace(
-        key,
-        std::make_shared<DeviceContext>(context->instance, *context, *pDevice,
-                                        was_layer_enabled, std::move(vtable)));
+        key, std::make_shared<DeviceContext>(context->instance, *context,
+                                             *pDevice, is_active,
+                                             display_extensions,
+                                             std::move(vtable)));
 
     return VK_SUCCESS;
 }
@@ -455,9 +621,9 @@ QueueSubmit(VkQueue queue, std::uint32_t submit_count,
 
     // We have to notify after we submit - otherwise we have a race where we
     // wait for work that wasn't submitted.
-    for (auto&& [submit, handle] : std::views::zip(submit_span, handles)) {
+    for (auto&& handle : handles) {
         handle->was_submitted.store(true, std::memory_order_relaxed);
-        context->strategy->notify_submit(submit, std::move(handle));
+        context->tracker->notify_submit(std::move(handle));
     }
 
     return VK_SUCCESS;
@@ -520,9 +686,9 @@ QueueSubmit2Impl(VkQueue queue, std::uint32_t submit_count,
         return result;
     }
 
-    for (auto&& [submit, handle] : std::views::zip(submit_span, handles)) {
+    for (auto&& handle : handles) {
         handle->was_submitted.store(true, std::memory_order_relaxed);
-        context->strategy->notify_submit(submit, std::move(handle));
+        context->tracker->notify_submit(std::move(handle));
     }
 
     return VK_SUCCESS;
@@ -545,268 +711,32 @@ QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* present_info) noexcept {
     const auto context = layer_context.get_context(queue);
     const auto& vtable = context->device.vtable;
 
-    const auto result = vtable.QueuePresentKHR(queue, present_info);
-
-    // We must *ALWAYS* notify_present regardless of the error here.
     assert(present_info);
-    if (context->strategy) {
-        context->strategy->notify_present(*present_info);
+    if (!context->device.pacer) {
+        return vtable.QueuePresentKHR(queue, present_info);
     }
 
-    return result;
-}
+    // The pacing block goes *after* the real present, not before it. The frame
+    // being presented is already finished, so delaying its hand-off would only
+    // add latency to it; what we want to delay is the application picking up
+    // the next frame, which is what it does when this call returns.
+    auto scope = context->device.pacer->begin_present(*present_info);
 
-static VKAPI_ATTR VkResult VKAPI_CALL EnumerateDeviceExtensionProperties(
-    VkPhysicalDevice physical_device, const char* pLayerName,
-    std::uint32_t* pPropertyCount,
-    VkExtensionProperties* pProperties) noexcept {
+    const auto result = vtable.QueuePresentKHR(queue, scope.info());
 
-    const auto context = layer_context.get_context(physical_device);
-    const auto& vtable = context->instance.vtable;
-
-    // This used to be a bit less complicated because we could rely on the
-    // loader mashing everything together provided we gave our anti lag
-    // extension in our JSON manifest. We now try to spoof nvidia and what we
-    // provide is dynamic. The JSON isn't dynamic. So we can't use that anymore!
-
-    // Simplest case, they're not asking about us so we can happily forward it.
-    if (pLayerName && std::string_view{pLayerName} != LAYER_NAME) {
-        return vtable.EnumerateDeviceExtensionProperties(
-            physical_device, pLayerName, pPropertyCount, pProperties);
-    }
-
-    // If we're exposing reflex we want to provide that extension instead.
-    const auto extension_properties = [&]() -> VkExtensionProperties {
-        if (context->instance.layer.should_expose_reflex) {
-            return {.extensionName = VK_NV_LOW_LATENCY_2_EXTENSION_NAME,
-                    .specVersion = VK_NV_LOW_LATENCY_2_SPEC_VERSION};
-        }
-        return {.extensionName = VK_AMD_ANTI_LAG_EXTENSION_NAME,
-                .specVersion = VK_AMD_ANTI_LAG_SPEC_VERSION};
-    }();
-
-    if (pLayerName) {
-        // This query is for our layer specifically.
-        if (!pProperties) {
-            *pPropertyCount = 1;
-            return VK_SUCCESS;
-        }
-
-        if (!*pPropertyCount) {
-            return VK_INCOMPLETE;
-        }
-
-        pProperties[0] = extension_properties;
-        *pPropertyCount = 1;
-
-        return VK_SUCCESS;
-    }
-
-    auto underlying_count = std::uint32_t{0};
-    if (const auto result = vtable.EnumerateDeviceExtensionProperties(
-            physical_device, nullptr, &underlying_count, nullptr);
-        result != VK_SUCCESS) {
-
-        return result;
-    }
-
-    // We have to fill this on our side because we need to know if it's already
-    // supported as to avoid inserting a duplicate.
-    auto underlying = std::vector<VkExtensionProperties>(underlying_count);
-    if (const auto result = vtable.EnumerateDeviceExtensionProperties(
-            physical_device, nullptr, &underlying_count, std::data(underlying));
-        result != VK_SUCCESS) {
-
-        return result;
-    }
-
-    const auto requires_insert =
-        std::ranges::none_of(underlying, [&](const auto& ep) {
-            return std::string_view{ep.extensionName} ==
-                   extension_properties.extensionName;
-        });
-
-    const auto target_count = underlying_count + requires_insert;
-    if (!pProperties) {
-        *pPropertyCount = target_count;
-        return VK_SUCCESS;
-    }
-
-    std::ranges::copy_n(std::begin(underlying),
-                        std::min(underlying_count, *pPropertyCount),
-                        pProperties);
-
-    const auto written_count = std::min(target_count, *pPropertyCount);
-    *pPropertyCount = written_count;
-
-    if (written_count < target_count) {
-        return VK_INCOMPLETE;
-    }
-
-    if (requires_insert) {
-        pProperties[target_count - 1] = extension_properties;
-    }
-
-    return VK_SUCCESS;
-}
-
-static VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceFeatures2Impl(
-    VkPhysicalDevice physical_device, VkPhysicalDeviceFeatures2* pFeatures,
-    const bool should_use_khr) noexcept {
-
-    const auto context = layer_context.get_context(physical_device);
-    const auto& vtable = context->instance.vtable;
-
-    if (should_use_khr) {
-        vtable.GetPhysicalDeviceFeatures2KHR(physical_device, pFeatures);
-    } else {
-        vtable.GetPhysicalDeviceFeatures2(physical_device, pFeatures);
-    }
-
-    // Don't provide AntiLag if we're exposing reflex - VK_NV_low_latency2 uses
-    // VkSurfaceCapabilities2KHR to determine if a surface is capable of reflex
-    // instead of AMD's physical device switch found here.
-    if (context->instance.layer.should_expose_reflex) {
-        return;
-    }
-
-    if (const auto alf =
-            vku::FindStructInPNextChain<VkPhysicalDeviceAntiLagFeaturesAMD>(
-                pFeatures->pNext);
-        alf) {
-
-        alf->antiLag = context->supports_required_extensions;
-    }
-}
-
-static VKAPI_ATTR void VKAPI_CALL
-GetPhysicalDeviceFeatures2(VkPhysicalDevice physical_device,
-                           VkPhysicalDeviceFeatures2* pFeatures) noexcept {
-
-    GetPhysicalDeviceFeatures2Impl(physical_device, pFeatures, false);
-}
-
-static VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceFeatures2KHR(
-    VkPhysicalDevice physical_device,
-    VkPhysicalDeviceFeatures2KHR* pFeatures) noexcept {
-
-    GetPhysicalDeviceFeatures2Impl(physical_device, pFeatures, true);
-}
-
-static VKAPI_ATTR void VKAPI_CALL
-GetPhysicalDeviceProperties(VkPhysicalDevice physical_device,
-                            VkPhysicalDeviceProperties* pProperties) noexcept {
-
-    const auto context = layer_context.get_context(physical_device);
-    const auto& vtable = context->instance.vtable;
-
-    vtable.GetPhysicalDeviceProperties(physical_device, pProperties);
-
-    if (layer_context.should_spoof_nvidia) {
-        pProperties->vendorID = LayerContext::NVIDIA_VENDOR_ID;
-        pProperties->deviceID = LayerContext::NVIDIA_DEVICE_ID;
-
-        // Most games seem happy without doing this, but I don't see why we
-        // shouldn't. I could see an application checking this.
-        std::strncpy(pProperties->deviceName, LayerContext::NVIDIA_DEVICE_NAME,
-                     VK_MAX_PHYSICAL_DEVICE_NAME_SIZE);
-    }
-}
-
-static VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceProperties2Impl(
-    VkPhysicalDevice physical_device, VkPhysicalDeviceProperties2* pProperties,
-    const bool should_use_khr) noexcept {
-
-    const auto context = layer_context.get_context(physical_device);
-    const auto& vtable = context->instance.vtable;
-
-    if (should_use_khr) {
-        vtable.GetPhysicalDeviceProperties2KHR(physical_device, pProperties);
-    } else {
-        vtable.GetPhysicalDeviceProperties2(physical_device, pProperties);
-    }
-
-    if (layer_context.should_spoof_nvidia) {
-        pProperties->properties.vendorID = LayerContext::NVIDIA_VENDOR_ID;
-        pProperties->properties.deviceID = LayerContext::NVIDIA_DEVICE_ID;
-        std::strncpy(pProperties->properties.deviceName,
-                     LayerContext::NVIDIA_DEVICE_NAME,
-                     VK_MAX_PHYSICAL_DEVICE_NAME_SIZE);
-    }
-}
-
-// Identical logic to GetPhysicalDeviceProperties.
-static VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceProperties2(
-    VkPhysicalDevice physical_device,
-    VkPhysicalDeviceProperties2* pProperties) noexcept {
-
-    GetPhysicalDeviceProperties2Impl(physical_device, pProperties, false);
-}
-
-static VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceProperties2KHR(
-    VkPhysicalDevice physical_device,
-    VkPhysicalDeviceProperties2* pProperties) noexcept {
-
-    GetPhysicalDeviceProperties2Impl(physical_device, pProperties, true);
-}
-
-static VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilities2KHR(
-    VkPhysicalDevice physical_device,
-    const VkPhysicalDeviceSurfaceInfo2KHR* pSurfaceInfo,
-    VkSurfaceCapabilities2KHR* pSurfaceCapabilities) noexcept {
-
-    const auto context = layer_context.get_context(physical_device);
-    const auto& vtable = context->instance.vtable;
-
-    if (const auto result = vtable.GetPhysicalDeviceSurfaceCapabilities2KHR(
-            physical_device, pSurfaceInfo, pSurfaceCapabilities);
-        result != VK_SUCCESS) {
-
-        return result;
-    }
-
-    // Don't do this unless we're spoofing nvidia.
-    if (!context->instance.layer.should_expose_reflex) {
-        return VK_SUCCESS;
-    }
-
-    const auto lsc =
-        vku::FindStructInPNextChain<VkLatencySurfaceCapabilitiesNV>(
-            pSurfaceCapabilities->pNext);
-    if (!lsc) {
-        return VK_SUCCESS;
-    }
-
-    // I eyeballed these - there might be more that we can support.
-    const auto supported_modes = std::vector<VkPresentModeKHR>{
-        VK_PRESENT_MODE_IMMEDIATE_KHR,
-        VK_PRESENT_MODE_MAILBOX_KHR,
-        VK_PRESENT_MODE_FIFO_KHR,
-    };
-    const auto num_supported_modes =
-        static_cast<std::uint32_t>(std::size(supported_modes));
-
-    // They're asking how many we want to return.
-    if (!lsc->pPresentModes) {
-        lsc->presentModeCount = num_supported_modes;
-        return VK_SUCCESS;
-    }
-
-    // Finally we can write what surfaces are capable.
-    const auto num_to_write =
-        std::min(lsc->presentModeCount, num_supported_modes);
-
-    std::ranges::copy_n(std::begin(supported_modes), num_to_write,
-                        lsc->pPresentModes);
-
-    lsc->presentModeCount = num_to_write;
-    return VK_SUCCESS;
+    // finish() can substitute a different result: a present that failed only
+    // because of what the layer added is retried without it.
+    return scope.finish(result);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
-CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo,
+CreateSwapchainKHR(VkDevice device, VkSwapchainCreateInfoKHR* pCreateInfo,
                    const VkAllocationCallbacks* pAllocator,
                    VkSwapchainKHR* pSwapchain) noexcept {
+
+    if (!(pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT))
+        pCreateInfo->flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+
     const auto context = layer_context.get_context(device);
     if (const auto result = context->vtable.CreateSwapchainKHR(
             device, pCreateInfo, pAllocator, pSwapchain);
@@ -815,9 +745,9 @@ CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo,
         return result;
     }
 
-    if (context->strategy) {
+    if (context->pacer) {
         assert(pCreateInfo);
-        context->strategy->notify_create_swapchain(*pSwapchain, *pCreateInfo);
+        context->pacer->notify_create_swapchain(*pSwapchain, *pCreateInfo);
     }
 
     return VK_SUCCESS;
@@ -827,102 +757,14 @@ static VKAPI_ATTR void VKAPI_CALL
 DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
                     const VkAllocationCallbacks* pAllocator) noexcept {
     const auto context = layer_context.get_context(device);
-    if (context->strategy) {
-        context->strategy->notify_destroy_swapchain(swapchain);
+
+    // Tear our state down first - the pacer holds swapchain-scoped driver
+    // objects and must not outlive the swapchain itself.
+    if (context->pacer) {
+        context->pacer->notify_destroy_swapchain(swapchain);
     }
+
     context->vtable.DestroySwapchainKHR(device, swapchain, pAllocator);
-}
-
-static VKAPI_ATTR void VKAPI_CALL
-AntiLagUpdateAMD(VkDevice device, const VkAntiLagDataAMD* pData) noexcept {
-
-    const auto context = layer_context.get_context(device);
-    if (layer_context.should_expose_reflex) {
-        context->vtable.AntiLagUpdateAMD(device, pData);
-        return;
-    }
-
-    assert(pData);
-    const auto strategy =
-        dynamic_cast<AntiLagDeviceStrategy*>(context->strategy.get());
-    assert(strategy);
-    strategy->notify_update(*pData);
-}
-
-static VKAPI_ATTR VkResult VKAPI_CALL
-LatencySleepNV(VkDevice device, VkSwapchainKHR swapchain,
-               const VkLatencySleepInfoNV* pSleepInfo) noexcept {
-    const auto context = layer_context.get_context(device);
-    if (!layer_context.should_expose_reflex) {
-        return context->vtable.LatencySleepNV(device, swapchain, pSleepInfo);
-    }
-
-    assert(pSleepInfo);
-    const auto strategy =
-        dynamic_cast<LowLatency2DeviceStrategy*>(context->strategy.get());
-    assert(strategy);
-    strategy->notify_latency_sleep_nv(swapchain, *pSleepInfo);
-
-    return VK_SUCCESS;
-}
-
-static VKAPI_ATTR void VKAPI_CALL QueueNotifyOutOfBandNV(
-    VkQueue queue, const VkOutOfBandQueueTypeInfoNV* pQueueTypeInfo) noexcept {
-
-    const auto context = layer_context.get_context(queue);
-    if (!layer_context.should_expose_reflex) {
-        context->device.vtable.QueueNotifyOutOfBandNV(queue, pQueueTypeInfo);
-        return;
-    }
-
-    // Kind of interesting how you can't turn it back on once it's turned off.
-    const auto strategy =
-        dynamic_cast<LowLatency2QueueStrategy*>(context->strategy.get());
-    assert(strategy);
-    strategy->notify_out_of_band();
-}
-
-static VKAPI_ATTR VkResult VKAPI_CALL
-SetLatencySleepModeNV(VkDevice device, VkSwapchainKHR swapchain,
-                      const VkLatencySleepModeInfoNV* pSleepModeInfo) noexcept {
-    const auto context = layer_context.get_context(device);
-    if (!layer_context.should_expose_reflex) {
-        return context->vtable.SetLatencySleepModeNV(device, swapchain,
-                                                     pSleepModeInfo);
-    }
-
-    const auto strategy =
-        dynamic_cast<LowLatency2DeviceStrategy*>(context->strategy.get());
-    assert(strategy);
-
-    strategy->notify_latency_sleep_mode(swapchain, pSleepModeInfo);
-
-    return VK_SUCCESS;
-}
-
-static VKAPI_ATTR void VKAPI_CALL
-SetLatencyMarkerNV(VkDevice device, VkSwapchainKHR swapchain,
-                   const VkSetLatencyMarkerInfoNV* info) noexcept {
-    if (!layer_context.should_expose_reflex) {
-        const auto context = layer_context.get_context(device);
-        context->vtable.SetLatencyMarkerNV(device, swapchain, info);
-        return;
-    }
-}
-
-static VKAPI_ATTR void VKAPI_CALL
-GetLatencyTimingsNV(VkDevice device, VkSwapchainKHR swapchain,
-                    VkGetLatencyMarkerInfoNV* timings) noexcept {
-    if (!layer_context.should_expose_reflex) {
-        const auto context = layer_context.get_context(device);
-        context->vtable.GetLatencyTimingsNV(device, swapchain, timings);
-        return;
-    }
-
-    // We don't do anything here but the caller still expects us to change
-    // timings->timingCount to the amount we wrote - so set it to zero.
-    assert(timings);
-    timings->timingCount = 0;
 }
 
 } // namespace low_latency
@@ -943,23 +785,6 @@ static const auto instance_functions = func_map_t{
     HOOK_ENTRY("vkCreateInstance", low_latency::CreateInstance),
     HOOK_ENTRY("vkDestroyInstance", low_latency::DestroyInstance),
 
-    HOOK_ENTRY("vkEnumerateDeviceExtensionProperties",
-               low_latency::EnumerateDeviceExtensionProperties),
-
-    HOOK_ENTRY("vkGetPhysicalDeviceFeatures2",
-               low_latency::GetPhysicalDeviceFeatures2),
-    HOOK_ENTRY("vkGetPhysicalDeviceFeatures2KHR",
-               low_latency::GetPhysicalDeviceFeatures2KHR),
-
-    HOOK_ENTRY("vkGetPhysicalDeviceProperties",
-               low_latency::GetPhysicalDeviceProperties),
-    HOOK_ENTRY("vkGetPhysicalDeviceProperties2KHR",
-               low_latency::GetPhysicalDeviceProperties2KHR),
-    HOOK_ENTRY("vkGetPhysicalDeviceProperties2",
-               low_latency::GetPhysicalDeviceProperties2),
-
-    HOOK_ENTRY("vkGetPhysicalDeviceSurfaceCapabilities2KHR",
-               low_latency::GetPhysicalDeviceSurfaceCapabilities2KHR),
 };
 
 static const auto device_functions = func_map_t{
@@ -975,14 +800,6 @@ static const auto device_functions = func_map_t{
     HOOK_ENTRY("vkQueueSubmit2KHR", low_latency::QueueSubmit2KHR),
 
     HOOK_ENTRY("vkQueuePresentKHR", low_latency::QueuePresentKHR),
-
-    HOOK_ENTRY("vkAntiLagUpdateAMD", low_latency::AntiLagUpdateAMD),
-
-    HOOK_ENTRY("vkGetLatencyTimingsNV", low_latency::GetLatencyTimingsNV),
-    HOOK_ENTRY("vkLatencySleepNV", low_latency::LatencySleepNV),
-    HOOK_ENTRY("vkQueueNotifyOutOfBandNV", low_latency::QueueNotifyOutOfBandNV),
-    HOOK_ENTRY("vkSetLatencyMarkerNV", low_latency::SetLatencyMarkerNV),
-    HOOK_ENTRY("vkSetLatencySleepModeNV", low_latency::SetLatencySleepModeNV),
 
     HOOK_ENTRY("vkCreateSwapchainKHR", low_latency::CreateSwapchainKHR),
     HOOK_ENTRY("vkDestroySwapchainKHR", low_latency::DestroySwapchainKHR),

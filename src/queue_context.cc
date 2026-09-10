@@ -2,8 +2,7 @@
 #include "device_context.hh"
 #include "helper.hh"
 #include "layer_context.hh"
-#include "strategies/anti_lag/queue_strategy.hh"
-#include "strategies/low_latency2/queue_strategy.hh"
+#include "queue_tracker.hh"
 #include "timestamp_pool.hh"
 
 #include <vulkan/vulkan_core.h>
@@ -39,24 +38,36 @@ QueueContext::QueueContext(DeviceContext& device, const VkQueue& queue,
 
     assert(qfi < std::size(*device.physical_device.queue_properties));
 
-    if (!this->device.was_layer_enabled) {
+    if (!this->device.is_active) {
         return;
     }
 
     this->command_pool = std::make_unique<CommandPoolOwner>(*this);
     this->timestamp_pool = std::make_unique<TimestampPool>(*this);
-    this->strategy = [&]() -> std::unique_ptr<QueueStrategy> {
-        if (device.instance.layer.should_expose_reflex) {
-            return std::make_unique<LowLatency2QueueStrategy>(*this);
-        }
-        return std::make_unique<AntiLagQueueStrategy>(*this);
-    }();
+    this->tracker = std::make_unique<QueueTracker>(*this);
 }
 
 QueueContext::~QueueContext() {}
 
 bool QueueContext::should_inject_timestamps() const {
-    if (!this->device.was_layer_enabled) {
+    if (!this->device.is_active || !this->tracker) {
+        return false;
+    }
+
+    if (!this->device.instance.layer.config.inject_timestamps) {
+        return false;
+    }
+
+    // Toggled off at runtime: stop paying for the queries too, not just the
+    // waiting.
+    if (!this->device.instance.layer.effect_enabled.load(
+            std::memory_order_relaxed)) {
+        return false;
+    }
+
+    // Nothing else tracks this queue, so there is no point paying for
+    // timestamps on it.
+    if (!this->tracker->should_track()) {
         return false;
     }
 

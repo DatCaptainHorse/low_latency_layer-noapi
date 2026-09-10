@@ -60,3 +60,37 @@ target_compile_options(${LIBRARY_NAME} PRIVATE
     -Wconversion
     -Wdouble-promotion
 )
+
+# A tiny headless presenting application used to validate the layer's own
+# Vulkan usage under VK_LAYER_KHRONOS_validation. Not installed.
+option(LOW_LATENCY_LAYER_BUILD_TESTS "Build the validation harness" OFF)
+if(LOW_LATENCY_LAYER_BUILD_TESTS)
+    add_executable(paced_present test/paced_present.cc)
+    target_link_libraries(paced_present Vulkan::Vulkan)
+
+    # Optional: present to a real window, which is the only way to exercise
+    # vsync backpressure.
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(XCB QUIET xcb)
+        if(XCB_FOUND)
+            target_compile_definitions(paced_present PRIVATE
+                PACED_PRESENT_HAVE_XCB)
+            target_include_directories(paced_present PRIVATE
+                ${XCB_INCLUDE_DIRS})
+            target_link_libraries(paced_present ${XCB_LIBRARIES})
+        endif()
+    endif()
+
+    add_executable(vblank_model_test
+        test/vblank_model_test.cc
+        src/vblank_model.cc
+    )
+    target_include_directories(vblank_model_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(vblank_model_test Vulkan::Vulkan)
+
+    enable_testing()
+    add_test(NAME vblank_model COMMAND vblank_model_test)
+endif()

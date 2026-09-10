@@ -3,7 +3,7 @@
 
 #include "context.hh"
 #include "device_clock.hh"
-#include "strategies/queue_strategy.hh"
+#include "queue_tracker.hh"
 #include "timestamp_pool.hh"
 
 #include <vulkan/utility/vk_dispatch_table.h>
@@ -14,9 +14,6 @@
 namespace low_latency {
 
 class QueueContext final : public Context {
-  private:
-    static constexpr auto MAX_TRACKED_PRESENT_IDS = 50u;
-
   public:
     DeviceContext& device;
 
@@ -43,7 +40,7 @@ class QueueContext final : public Context {
 
     std::unique_ptr<CommandPoolOwner> command_pool{};
     std::unique_ptr<TimestampPool> timestamp_pool{};
-    std::unique_ptr<QueueStrategy> strategy{};
+    std::unique_ptr<QueueTracker> tracker{};
 
   public:
     explicit QueueContext(DeviceContext& device_context, const VkQueue& queue,

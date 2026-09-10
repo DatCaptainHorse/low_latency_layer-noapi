@@ -3,6 +3,7 @@
 
 #include <vulkan/utility/vk_dispatch_table.h>
 
+#include <cstdint>
 #include <memory>
 #include <unordered_map>
 
@@ -17,8 +18,12 @@ class InstanceContext final : public Context {
   public:
     const LayerContext& layer;
     const VkInstance instance{};
+
+    // The version the application asked for, which decides whether promoted
+    // entry points like vkGetPhysicalDeviceFeatures2 may be called at all.
+    const std::uint32_t api_version{};
+
     const VkuInstanceDispatchTable vtable{};
-    const bool is_simulation_decoupled{};
 
     std::unordered_map<void*, std::shared_ptr<PhysicalDeviceContext>>
         physical_devices{};
@@ -26,7 +31,7 @@ class InstanceContext final : public Context {
   public:
     explicit InstanceContext(const LayerContext& parent_context,
                              const VkInstance& instance,
-                             const VkInstanceCreateInfo& create_info,
+                             const std::uint32_t& api_version,
                              VkuInstanceDispatchTable&& vtable);
     virtual ~InstanceContext();
 };

@@ -1,11 +1,16 @@
 #ifndef LAYER_CONTEXT_HH_
 #define LAYER_CONTEXT_HH_
 
+#include <atomic>
+#include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vulkan/vulkan_core.h>
 
+#include "config.hh"
 #include "context.hh"
+#include "hotkey.hh"
 #include "device_context.hh"
 #include "instance_context.hh"
 #include "physical_device_context.hh"
@@ -47,30 +52,13 @@ template <DispatchableType D>
 using dispatch_context_t = typename context_for_t<D>::context;
 
 class LayerContext final : public Context {
-  private:
-    // VK_NV_low_latency2 should be provided instead of VK_AMD_anti_lag.
-    static constexpr auto REFLEX_ENV = "LOW_LATENCY_LAYER_REFLEX";
-
-    // The card's vendor, id, and device name will be modified to appear as a
-    // NVIDIA card.
-    static constexpr auto SPOOF_NVIDIA_ENV = "LOW_LATENCY_LAYER_SPOOF_NVIDIA";
-
-    // Additional delays for decoupled simulation should be forced on
-    // (delay_controller). This is usually automatically handled on a
-    // per-application basis.
-    static constexpr auto FORCE_DECOUPLED_ENV =
-        "LOW_LATENCY_LAYER_FORCE_DECOUPLED";
-
   public:
-    // Constants for spoofing.
-    static constexpr auto NVIDIA_VENDOR_ID = 0x10DE;
-    static constexpr auto NVIDIA_DEVICE_ID = 0x2B85; // 5090
-    static constexpr auto NVIDIA_DEVICE_NAME = "NVIDIA GeForce RTX 5090";
+    const Config config{};
 
-  public:
-    const bool should_expose_reflex{};
-    const bool should_spoof_nvidia{};
-    const bool should_force_decoupled{};
+    // Whether the layer's effect is currently applied. Toggled by the hotkey
+    // from another thread and read on every submit and present, so it is an
+    // atomic rather than anything lock-shaped.
+    std::atomic<bool> effect_enabled{true};
 
     std::shared_mutex mutex{};
     std::unordered_map<void*, std::shared_ptr<Context>> contexts{};
@@ -78,6 +66,16 @@ class LayerContext final : public Context {
   public:
     explicit LayerContext();
     virtual ~LayerContext();
+
+  private:
+    std::once_flag hotkey_once{};
+    std::unique_ptr<HotkeyMonitor> hotkey{};
+
+  public:
+    // Started on the first device the layer is active on, rather than at
+    // library load: opening /dev/input is not something to do to every process
+    // that happens to link Vulkan.
+    void ensure_hotkey();
 
   public:
     template <DispatchableType DT> static void* get_key(const DT& dt) {
