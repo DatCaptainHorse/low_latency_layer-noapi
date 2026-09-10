@@ -41,7 +41,7 @@ Also there's a hotkey (for Linux only) `Shift + F10` that toggles layer on/off a
 | Variable | Description |
 | :--- | :--- |
 | `LOW_LATENCY_LAYER` | Expose to enable the layer. |
-| `LOW_LATENCY_LAYER_MODE` | `off|drain|deadline` - defaults to `auto` which picks `deadline` if `VK_EXT_present_timing` is available. |
+| `LOW_LATENCY_LAYER_MODE` | `off,drain,deadline` - defaults to `auto` which picks `deadline` if `VK_EXT_present_timing` is available. |
 | `LOW_LATENCY_LAYER_FPS_LIMIT` | Allow limiting FPS, defaults to 0 (uncapped) |
 | `LOW_LATENCY_LAYER_MARGIN_US` | The amount of slack allowed for timing in microseconds, defaults to 1000. |
 | `LOW_LATENCY_LAYER_NO_PRESENT_TIMING` | Force-disable `VK_EXT_present_timing` even if supported. |
