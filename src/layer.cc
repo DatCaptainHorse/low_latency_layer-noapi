@@ -730,28 +730,41 @@ QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* present_info) noexcept {
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
-CreateSwapchainKHR(VkDevice device, VkSwapchainCreateInfoKHR* pCreateInfo,
+CreateSwapchainKHR(VkDevice device,
+                   const VkSwapchainCreateInfoKHR* pCreateInfo,
                    const VkAllocationCallbacks* pAllocator,
                    VkSwapchainKHR* pSwapchain) noexcept {
 
     const auto context = layer_context.get_context(device);
-    if (context->instance.layer.config.allow_present_timing
-        && context->display_extensions.present_timing
-        && !(pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT))
-    {
-        pCreateInfo->flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+    assert(pCreateInfo);
+
+    // Present timing has to be asked for at swapchain creation: without this
+    // flag the swapchain is not set up to record anything, and every later
+    // query comes back empty or unsupported.
+    //
+    // Patched into a copy rather than into the application's own structure.
+    // The loader calls this hook as PFN_vkCreateSwapchainKHR, whose create
+    // info is const, so the application is entitled to have put it in
+    // read-only storage - and is equally entitled not to find flags it never
+    // set when it reuses the structure to recreate the swapchain.
+    auto patched = *pCreateInfo;
+    if (context->instance.layer.config.allow_present_timing &&
+        context->display_extensions.present_timing) {
+
+        patched.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
     }
 
     if (const auto result = context->vtable.CreateSwapchainKHR(
-            device, pCreateInfo, pAllocator, pSwapchain);
+            device, &patched, pAllocator, pSwapchain);
         result != VK_SUCCESS) {
 
         return result;
     }
 
     if (context->pacer) {
-        assert(pCreateInfo);
-        context->pacer->notify_create_swapchain(*pSwapchain, *pCreateInfo);
+        // The patched copy, so the pacer sees the flags the swapchain was
+        // actually created with.
+        context->pacer->notify_create_swapchain(*pSwapchain, patched);
     }
 
     return VK_SUCCESS;
